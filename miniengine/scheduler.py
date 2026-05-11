@@ -162,8 +162,16 @@ class Scheduler:
         pool = self.engine.pool
         finished: list[Request] = []
 
+        # Packed-prefill token budget (DistServe §3.1 ``L_m`` / Sarathi-Serve
+        # §4.3 ``τ``). 0 = no cap (default). Capping the total number of
+        # prompt tokens admitted in a single packed prefill bounds the
+        # prefill-step latency, which on L4 dominates TTFT spikes when a
+        # large bursts admits 8+ long prompts in one step.
+        prefill_budget = int(getattr(self.engine, "prefill_token_budget", 0))
+
         with self._lock:
             to_prefill: list[Request] = []
+            packed_tokens = 0
             while (
                 self.waiting and len(self.running) + len(to_prefill) < self.max_running
             ):
@@ -182,9 +190,20 @@ class Scheduler:
                     continue
                 if needed > pool.num_free:
                     break
+                if (
+                    prefill_budget > 0
+                    and to_prefill
+                    and packed_tokens + req.num_input_tokens > prefill_budget
+                ):
+                    # Defer to next step. Keeps the packed prefill kernel's
+                    # work-per-step below ``L_m``; never starves a single
+                    # oversized request because the ``to_prefill`` list is
+                    # non-empty only after the first admission succeeded.
+                    break
                 self.waiting.popleft()
                 req.kv_cache = pool.allocate(needed)
                 to_prefill.append(req)
+                packed_tokens += req.num_input_tokens
 
         if to_prefill:
             for req in to_prefill:

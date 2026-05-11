@@ -182,6 +182,7 @@ class CudaGraphRunner:
             is_prefill=False,
             block_table=block_table,
             cache_seqlens=cache_seqlens,
+            num_splits=getattr(engine, "flash_num_splits", 0),
         )
         kv_caches = [
             (pool.k_cache(i), pool.v_cache(i)) for i in range(pool.num_layers)

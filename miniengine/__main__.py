@@ -83,6 +83,40 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated bucket batch sizes to capture when "
         "--cuda-graph is set; live batches are rounded UP to the nearest.",
     )
+    # ── Iteration-loop knobs (default to no-op) ────────────────────────
+    p.add_argument(
+        "--flash-num-splits",
+        type=int,
+        default=0,
+        help="Split-KV depth passed to flash_attn_with_kvcache "
+        "(FlashAttention §4 IO-aware). 0 = let the kernel pick. On L4 "
+        "the auto-heuristic often under-uses the 58 SMs; try 2/4/8 to "
+        "boost paged-decode occupancy.",
+    )
+    p.add_argument(
+        "--lpt-reorder",
+        action="store_true",
+        help="LPT virtual reorder of the live decode batch by descending "
+        "KV length before the kernel call (FA4 §3.3 Longest-Processing-"
+        "Time). Marginal on bandwidth-bound decode but free.",
+    )
+    p.add_argument(
+        "--rope-cache-cap",
+        type=int,
+        default=Engine.DEFAULT_ROPE_CACHE_CAP,
+        help="Pre-populate RoPE cos/sin cache to this length and lock "
+        "further growth, removing one host-sync per forward "
+        "(FlashInfer §D.1-derived). 0 = keep dynamic growth.",
+    )
+    p.add_argument(
+        "--prefill-token-budget",
+        type=int,
+        default=0,
+        help="Packed-prefill token budget τ (DistServe §3.1 / "
+        "Sarathi-Serve §4.3). When >0, the scheduler caps the packed "
+        "prefill at this many prompt tokens per step; spillover defers "
+        "to the next step. 0 = no cap.",
+    )
     return p.parse_args()
 
 
@@ -117,6 +151,10 @@ def main() -> None:
         torch_compile=args.torch_compile,
         cuda_graph=args.cuda_graph,
         cuda_graph_batch_sizes=cuda_graph_batch_sizes,
+        flash_num_splits=args.flash_num_splits,
+        lpt_reorder=args.lpt_reorder,
+        rope_cache_cap=args.rope_cache_cap,
+        prefill_token_budget=args.prefill_token_budget,
     )
     sched = Scheduler(engine=engine, max_running=args.max_running, mode=args.mode)
 

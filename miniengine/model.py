@@ -59,6 +59,11 @@ class PagedAttentionMetadata:
     ``flash_attn_with_kvcache`` and consumes `block_table`, `cache_seqlens`.
     The kernels read/write the per-layer pool tensors that the engine passes
     in as `kv_caches[i] = (pool.k_cache(i), pool.v_cache(i))`.
+
+    ``num_splits`` is the Split-KV depth forwarded to ``flash_attn_with_kvcache``
+    (FlashAttention §4 IO-aware analogue; flash-attn 2.8 ``num_splits`` kwarg).
+    0 = let the kernel's heuristic choose. L4 has only 58 SMs vs A100's 108,
+    so the auto pick can leave occupancy on the table for our paged decode.
     """
 
     is_prefill: bool
@@ -67,6 +72,7 @@ class PagedAttentionMetadata:
     slot_mapping: torch.Tensor | None = None
     block_table: torch.Tensor | None = None
     cache_seqlens: torch.Tensor | None = None
+    num_splits: int = 0
 
 
 # ── Config ──────────────────────────────────────────────────────────────
@@ -132,8 +138,16 @@ class RotaryEmbedding(nn.Module):
     Rotary Position Embedding (RoPE).
 
     Precomputes and caches cos/sin tables, indexed by position_ids at
-    forward time.  The cache grows on-demand so we never allocate for the
+    forward time. The cache grows on-demand so we never allocate for the
     full 256K context upfront.
+
+    When ``_static_cap`` is set (via :meth:`prepopulate`), the forward path
+    is sync-free: it skips ``int(position_ids.max().item())`` and indexes
+    straight into the cache. This mirrors the ``CudaGraphRunner`` patch but
+    applies it to ALL paged paths (including ``paged`` and ``paged+compile``),
+    so the host doesn't drain the launch queue on every decode step. Motivated
+    by FlashInfer §D.1 "no host-sync inside the captured region" — the same
+    rule shortens non-graph forwards too.
     """
 
     def __init__(self, head_dim: int, theta: float = 10000.0):
@@ -145,6 +159,33 @@ class RotaryEmbedding(nn.Module):
         self._cos: torch.Tensor | None = None
         self._sin: torch.Tensor | None = None
         self._cached_len: int = 0
+        self._static_cap: int = 0
+
+    @torch.no_grad()
+    def prepopulate(self, length: int) -> None:
+        """Grow the cos/sin cache to ``length`` and lock further growth.
+
+        Once called, :meth:`forward` no longer probes ``position_ids.max()``
+        — callers must guarantee positions stay below ``length``. The engine
+        sets this from ``ModelConfig.max_position_embeddings`` clipped to a
+        sane inference cap.
+        """
+        if length <= self._cached_len:
+            self._static_cap = max(self._static_cap, length)
+            return
+        self._grow_cache(length)
+        self._static_cap = length
+
+    @torch.no_grad()
+    def _grow_cache(self, length: int) -> None:
+        t = torch.arange(
+            length, device=self.inv_freq.device, dtype=self.inv_freq.dtype
+        )
+        freqs = torch.outer(t, self.inv_freq)
+        emb = torch.cat([freqs, freqs], dim=-1)
+        self._cos = emb.cos()
+        self._sin = emb.sin()
+        self._cached_len = length
 
     @torch.no_grad()
     def forward(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -156,21 +197,15 @@ class RotaryEmbedding(nn.Module):
             cos, sin each of shape (batch, 1, seq_len, head_dim) —
             broadcastable over the head dimension.
         """
-        max_pos = int(position_ids.max().item()) + 1
+        if self._static_cap == 0:
+            max_pos = int(position_ids.max().item()) + 1
+            if self._cos is None or max_pos > self._cached_len:
+                length = max(max_pos, self._cached_len * 2, 256)
+                self._grow_cache(length)
+        elif self._cos is None:
+            self._grow_cache(self._static_cap)
 
-        if self._cos is None or max_pos > self._cached_len:
-            length = max(max_pos, self._cached_len * 2, 256)
-            t = torch.arange(
-                length, device=self.inv_freq.device, dtype=self.inv_freq.dtype
-            )
-            freqs = torch.outer(t, self.inv_freq)  # (length, head_dim/2)
-            emb = torch.cat([freqs, freqs], dim=-1)  # (length, head_dim)
-            self._cos = emb.cos()
-            self._sin = emb.sin()
-            self._cached_len = length
-
-        # Index into cache: (batch, seq_len, head_dim) → add head dim
-        cos = self._cos[position_ids].unsqueeze(2)  # (batch, seq_len, 1, head_dim)
+        cos = self._cos[position_ids].unsqueeze(2)
         sin = self._sin[position_ids].unsqueeze(2)
         return cos, sin
 
@@ -409,6 +444,7 @@ class Attention(nn.Module):
             cache_seqlens=meta.cache_seqlens,
             block_table=meta.block_table,
             causal=True,
+            num_splits=meta.num_splits,
         )
         out = out.view(bsz, seq_len, self.num_heads * head_dim)
         return out, None

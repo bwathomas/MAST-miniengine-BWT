@@ -37,6 +37,7 @@ from miniengine.model import (
     CausalLM,
     ModelConfig,
     PagedAttentionMetadata,
+    RotaryEmbedding,
     _import_flash_attn,
     load_weights,
 )
@@ -53,6 +54,8 @@ class Engine:
     # mid-decode, so we validate at startup.
     _FLASH_ATTN_PAGE_ALIGNMENT = 256
 
+    DEFAULT_ROPE_CACHE_CAP = 8192
+
     def __init__(
         self,
         model_path: str,
@@ -64,6 +67,10 @@ class Engine:
         torch_compile: bool = False,
         cuda_graph: bool = False,
         cuda_graph_batch_sizes: list[int] | None = None,
+        flash_num_splits: int = 0,
+        lpt_reorder: bool = False,
+        rope_cache_cap: int = DEFAULT_ROPE_CACHE_CAP,
+        prefill_token_budget: int = 0,
     ):
         if mode == "paged":
             align = self._FLASH_ATTN_PAGE_ALIGNMENT
@@ -83,6 +90,14 @@ class Engine:
         self.cuda_graph = cuda_graph
         self.pool: KVMemoryPool | None = None
         self.cuda_graph_runner: CudaGraphRunner | None = None
+
+        # ── Iteration-loop knobs ───────────────────────────────────────
+        # All four default to "no-op" so the previously-measured rows are
+        # not perturbed unless the user explicitly opts in via CLI flag.
+        self.flash_num_splits: int = int(flash_num_splits)
+        self.lpt_reorder: bool = bool(lpt_reorder)
+        self.rope_cache_cap: int = int(rope_cache_cap)
+        self.prefill_token_budget: int = int(prefill_token_budget)
 
         # ── Tokenizer (still from HF — it's just a tokenizer) ──────────
         logger.info("Loading tokenizer from %s …", model_path)
@@ -113,6 +128,27 @@ class Engine:
         load_weights(self.model, model_path, dtype=dtype, device=device)
         self.model.eval()
         self.config = config
+
+        # ── Sync-free RoPE (FlashInfer §D.1-derived) ─────────────────────
+        # ``RotaryEmbedding.forward`` defaults to ``int(position_ids.max().item())``
+        # — a per-step host sync on EVERY paged forward. The CudaGraphRunner
+        # was already patching it away for the captured region; lift the
+        # same trick to the non-graph paths so ``paged`` and
+        # ``paged+compile`` decode steps also stop draining the launch
+        # queue. ``rope_cache_cap`` is a clip cap (clamped against the
+        # model's own max_position_embeddings to keep memory bounded).
+        if str(device).startswith("cuda") and self.rope_cache_cap > 0:
+            cap = min(self.rope_cache_cap, int(config.max_position_embeddings))
+            n_patched = 0
+            for module in self.model.modules():
+                if isinstance(module, RotaryEmbedding):
+                    module.prepopulate(cap)
+                    n_patched += 1
+            logger.info(
+                "RoPE cache pre-populated  (cap=%d, modules=%d, sync-free forward)",
+                cap,
+                n_patched,
+            )
 
         # Paged-mode list of ``(k_cache, v_cache)`` per layer. Stable for the
         # engine's lifetime (the pool's per-layer tensors never change), so
@@ -545,14 +581,47 @@ class Engine:
         When a ``CudaGraphRunner`` is available and the live batch fits a
         captured bucket, the model forward is replayed from a captured
         graph instead of issued op-by-op.
+
+        When ``self.lpt_reorder`` is set, rows are virtually permuted into
+        descending-KV-length order before the kernel call and unpermuted
+        when reading per-row logits (FA4 §3.3 Longest-Processing-Time:
+        front-loading the largest critical path tends to reduce the
+        kernel's tail latency on bandwidth-limited GPUs).
+
+        When ``self.flash_num_splits != 0``, the kwarg is forwarded to
+        ``flash_attn_with_kvcache`` (Split-KV depth). On L4 the kernel's
+        auto-heuristic can leave SMs idle at small batch sizes; an
+        explicit value of 2/4/8 is often a measurable win.
         """
         if not requests:
             return []
         assert self.pool is not None, "paged decode requires a KV pool"
 
         batch_size = len(requests)
-        page_tables: list[list[int]] = [req.kv_cache for req in requests]
-        cache_lens = [self._paged_kv_length(req) for req in requests]
+        page_tables_orig: list[list[int]] = [req.kv_cache for req in requests]
+        cache_lens_orig = [self._paged_kv_length(req) for req in requests]
+
+        if self.lpt_reorder and batch_size > 1:
+            # Descending-KV-length permutation. ``order[k]`` = original
+            # index of the row now sitting at LPT position k. Build all
+            # row-shaped inputs in LPT order; remember ``inverse`` so we
+            # write logits back to original row positions before sampling.
+            order = sorted(
+                range(batch_size), key=lambda i: cache_lens_orig[i], reverse=True
+            )
+            inverse = [0] * batch_size
+            for k, src in enumerate(order):
+                inverse[src] = k
+            requests_kern = [requests[i] for i in order]
+            page_tables = [page_tables_orig[i] for i in order]
+            cache_lens = [cache_lens_orig[i] for i in order]
+        else:
+            order = list(range(batch_size))
+            inverse = order
+            requests_kern = requests
+            page_tables = page_tables_orig
+            cache_lens = cache_lens_orig
+
         max_pages = max(len(pt) for pt in page_tables)
         max_position = max(cache_lens)
 
@@ -563,18 +632,13 @@ class Engine:
 
         if use_graph:
             assert runner is not None
-            # Hand raw Python lists to the runner. It stages them on its
-            # persistent pinned host scratch in one batched CPU pass, then
-            # issues four async H2D copies into the captured GPU buffers
-            # before replaying — instead of the previous per-element GPU
-            # writes that were silently re-serialising the critical path.
-            input_ids_list = [req.output_ids[-1] for req in requests]
+            input_ids_list = [req.output_ids[-1] for req in requests_kern]
             logits, _ = runner.replay_paged_decode(
                 input_ids_list, cache_lens, page_tables
             )
         else:
             input_ids = torch.tensor(
-                [[req.output_ids[-1]] for req in requests],
+                [[req.output_ids[-1]] for req in requests_kern],
                 dtype=torch.long,
                 device=self.device,
             )
@@ -593,6 +657,7 @@ class Engine:
                 is_prefill=False,
                 block_table=block_table,
                 cache_seqlens=cache_seqlens,
+                num_splits=self.flash_num_splits,
             )
             assert self._paged_kv_caches is not None
             logits, _ = self.model(
@@ -604,9 +669,12 @@ class Engine:
 
         token_ids: list[int] = []
         for i, req in enumerate(requests):
+            kern_row = inverse[i]
             token_ids.append(
                 sample_token(
-                    logits[i : i + 1, -1, :], req.sampling_params, req.output_ids
+                    logits[kern_row : kern_row + 1, -1, :],
+                    req.sampling_params,
+                    req.output_ids,
                 )
             )
         return token_ids

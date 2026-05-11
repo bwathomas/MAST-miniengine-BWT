@@ -57,3 +57,7 @@ Thumbs.db
 *.pt
 *.pth
 *.gguf
+
+# Course papers (read locally, not for the repo)
+Papers/
+

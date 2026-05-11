@@ -29,13 +29,19 @@ logger = logging.getLogger(__name__)
 
 class Scheduler:
     """
-    FCFS scheduler with two modes:
+    FCFS scheduler with three modes:
 
       baseline : process one request to completion before the next.
       batched  : iteration-level batching — admit + prefill many requests,
                  then advance all running requests by one token in a
                  single batched forward pass.  New requests can join the
                  batch the same step they finish prefill.
+      paged    : iteration-level batching backed by the engine's KV pool
+                 — admission allocates the request's worst-case page
+                 budget up front (prompt + max_new_tokens). Pool capacity
+                 is the only admission constraint; requests that don't
+                 fit right now wait, requests that can never fit are
+                 deterministically rejected.
 
     Public API (thread-safe):
         add_request(req)   — enqueue a new request
@@ -111,6 +117,8 @@ class Scheduler:
         """
         if self.mode == "baseline":
             return self._step_baseline()
+        if self.mode == "paged":
+            return self._step_paged()
         return self._step_batched()
 
     def _step_baseline(self) -> list[Request]:
@@ -133,6 +141,73 @@ class Scheduler:
             self._stream_token(req, token_id)
 
         self._finish_request(req, finished)
+        return finished
+
+    def _step_paged(self) -> list[Request]:
+        """
+        Paged iteration-level step.
+
+        Admission asks the engine's KV pool for the request's worst-case
+        page budget (prompt + max_new_tokens). Three outcomes:
+          - budget exceeds the entire pool → reject deterministically.
+          - budget fits but free pages are insufficient right now → leave
+            the request at the head of the waiting queue (we admit FCFS
+            so a single oversized request can't starve smaller ones
+            indefinitely once others retire).
+          - budget fits and is available → allocate, prefill, run.
+        Decode is one batched forward pass through the paged engine path.
+        Finished requests release their pages back to the pool.
+        """
+        assert self.engine.pool is not None, "paged mode requires an engine KV pool"
+        pool = self.engine.pool
+        finished: list[Request] = []
+
+        with self._lock:
+            to_prefill: list[Request] = []
+            while (
+                self.waiting and len(self.running) + len(to_prefill) < self.max_running
+            ):
+                req = self.waiting[0]
+                budget = req.num_input_tokens + req.sampling_params.max_new_tokens
+                needed = pool.pages_needed(budget)
+                if needed > pool.num_pages:
+                    self.waiting.popleft()
+                    self._reject_request(
+                        req,
+                        f"request budget ({budget} tokens, {needed} pages) exceeds "
+                        f"pool capacity ({pool.num_pages} pages × {pool.page_size} "
+                        f"tokens)",
+                        finished,
+                    )
+                    continue
+                if needed > pool.num_free:
+                    break
+                self.waiting.popleft()
+                req.kv_cache = pool.allocate(needed)
+                to_prefill.append(req)
+
+        for req in to_prefill:
+            req.status = RequestStatus.RUNNING
+            token_id = self.engine.prefill(req)
+            req.output_ids.append(token_id)
+            self._stream_token(req, token_id)
+            if self._check_finished(req, token_id):
+                self._finish_request(req, finished)
+            else:
+                self.running.append(req)
+
+        if self.running:
+            token_ids = self.engine.batched_decode(self.running)
+            still_running: list[Request] = []
+            for req, token_id in zip(self.running, token_ids):
+                req.output_ids.append(token_id)
+                self._stream_token(req, token_id)
+                if self._check_finished(req, token_id):
+                    self._finish_request(req, finished)
+                else:
+                    still_running.append(req)
+            self.running = still_running
+
         return finished
 
     def _step_batched(self) -> list[Request]:
@@ -197,7 +272,7 @@ class Scheduler:
     def _finish_request(self, req: Request, finished_list: list[Request]) -> None:
         """Mark a request as finished and free its resources."""
         req.status = RequestStatus.FINISHED
-        req.kv_cache = None  # release GPU memory
+        self._release_kv(req)
         req.token_queue.put(TokenOutput(token_id=-1, token_text="", finished=True))
         finished_list.append(req)
 
@@ -210,3 +285,30 @@ class Scheduler:
             len(self.running),
             len(self.waiting),
         )
+
+    def _reject_request(
+        self, req: Request, reason: str, finished_list: list[Request]
+    ) -> None:
+        """Deterministically reject an admission-time impossible request."""
+        logger.warning(
+            "Rejecting request %s — %s",
+            req.request_id,
+            reason,
+        )
+        req.status = RequestStatus.FINISHED
+        self._release_kv(req)
+        req.token_queue.put(TokenOutput(token_id=-1, token_text="", finished=True))
+        finished_list.append(req)
+        self.total_finished += 1
+
+    def _release_kv(self, req: Request) -> None:
+        """Return KV resources held by the request to the pool / GC."""
+        if (
+            self.mode == "paged"
+            and self.engine.pool is not None
+            and isinstance(req.kv_cache, list)
+            and req.kv_cache
+            and isinstance(req.kv_cache[0], int)
+        ):
+            self.engine.pool.free(req.kv_cache)
+        req.kv_cache = None

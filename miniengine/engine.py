@@ -127,7 +127,7 @@ class Engine:
             )
 
         if torch_compile:
-            self._compile_mlp_modules()
+            self._compile_layer_subregions()
 
         if cuda_graph:
             if mode != "paged":
@@ -195,41 +195,53 @@ class Engine:
             * torch.tensor([], dtype=self.dtype).element_size()
         )
 
-    # ── torch.compile of MLP sub-region (M2 Part C) ─────────────────────
+    # ── torch.compile of layer sub-regions (M2 Part C) ───────────────────
 
-    def _compile_mlp_modules(self) -> None:
-        """Wrap each transformer block's MLP with ``torch.compile``.
+    def _compile_layer_subregions(self) -> None:
+        """Wrap each transformer block's pre-attn and post-attn with ``torch.compile``.
 
-        Compile mode is chosen based on whether manual CUDA-graph capture
-        is also enabled:
+        **Why two sub-regions, not the MLP alone?** A previous iteration
+        compiled only ``layer.mlp``. That region is ~1ms of GPU work per
+        call at batch=32, while ``torch.compile``'s per-call dispatch
+        overhead (dynamo guards + Inductor entry) and ``reduce-overhead``'s
+        static-buffer copies add ~0.3–0.5ms each. With 36 layers the
+        overhead (~11–18ms/step) swamped the SwiGLU fusion benefit
+        (~1–3ms/step) and the run regressed by 13–31% on TPOT.
 
-        * **Standalone** (``--torch-compile`` only): ``mode='reduce-overhead'``.
-          Inductor uses internal CUDA graphs to eliminate per-call Python /
-          dispatch overhead, which is what actually pays for compile at
-          decode batch sizes. Without this, the dynamo+inductor dispatch
-          path costs more than the SwiGLU fusion saves and the run regresses.
+        Splitting the layer forward around the opaque flash-attn call
+        (see :meth:`TransformerBlock._pre_attn` /
+        :meth:`TransformerBlock._post_attn`) gives the compiler two
+        regions that are each 3–5× the size of the MLP and unlock real
+        fusions at the LN→GEMM seams, gate*up*silu, and residual epilogs.
+        Per-call overhead now amortizes against a much larger denominator.
 
-        * **Stacked** (``--torch-compile --cuda-graph``): ``mode='default'``.
-          The outer manual graph in :class:`CudaGraphRunner` captures the
-          entire decode forward — we must NOT have inner CUDA graphs from
-          ``reduce-overhead`` inside it (CUDA does not allow nested capture).
-          ``mode='default'`` still gets Inductor's SwiGLU fusion; the outer
-          graph removes the per-op Python overhead.
+        **Why ``mode='default'`` (not ``'reduce-overhead'``)?** Two
+        reasons:
 
-        The MLP is the most stable sub-region in the decode path: shape
-        ``(B, 1, hidden_size)`` and no Python branching, so dynamo
-        specializes cleanly. ``dynamic=True`` lets a single compilation
-        serve all batch sizes.
+        * Stacked with ``--cuda-graph`` the outer manual graph captures
+          the whole decode forward; an inner ``reduce-overhead`` CUDA
+          graph would nest captures, which CUDA forbids.
+        * Standalone, ``reduce-overhead``'s static input/output buffer
+          copies scale with batch size and were the dominant overhead at
+          conc=32 (~+15ms/step). ``mode='default'`` skips those copies
+          entirely and relies on the bigger compiled region to amortize
+          the remaining dynamo dispatch.
+
+        ``dynamic=True`` shares one compiled artifact across decode
+        batch sizes 1..32 and the packed-prefill shape.
         """
-        if self.cuda_graph:
-            compile_mode = "default"
-        else:
-            compile_mode = "reduce-overhead"
+        compile_mode = "default"
         layers = self.model.model.layers
         for layer in layers:
-            layer.mlp = torch.compile(layer.mlp, mode=compile_mode, dynamic=True)
+            layer._pre_attn = torch.compile(
+                layer._pre_attn, mode=compile_mode, dynamic=True
+            )
+            layer._post_attn = torch.compile(
+                layer._post_attn, mode=compile_mode, dynamic=True
+            )
         logger.info(
-            "torch.compile enabled on MLP of %d layers (mode=%s, dynamic=True)",
+            "torch.compile enabled on pre/post-attn of %d layers "
+            "(mode=%s, dynamic=True, 2 compile targets per layer)",
             len(layers),
             compile_mode,
         )

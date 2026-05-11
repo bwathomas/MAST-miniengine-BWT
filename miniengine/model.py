@@ -235,6 +235,84 @@ class Attention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
+    def _qkv_with_rope(
+        self,
+        hidden: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Q/K/V projection + per-head reshape + QK-Norm + RoPE.
+
+        Pure compute, no opaque kernels — a clean ``torch.compile`` target.
+        Returns q, k, v shaped ``(B, H_q/H_kv, T, D)`` ready for the
+        attention kernel.
+        """
+        bsz, seq_len, _ = hidden.shape
+        q = (
+            self.q_proj(hidden)
+            .view(bsz, seq_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        k = (
+            self.k_proj(hidden)
+            .view(bsz, seq_len, self.num_kv_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        v = (
+            self.v_proj(hidden)
+            .view(bsz, seq_len, self.num_kv_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+        return q, k, v
+
+    def _attn_kernel(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+        attention_mask: torch.Tensor | None = None,
+        paged_metadata: PagedAttentionMetadata | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+        """Run the attention kernel (flash-attn paged, or SDPA fallback).
+
+        Kept **outside** any ``torch.compile`` region: the flash-attn calls
+        are opaque CUDA extensions that dynamo cannot trace through, and
+        the SDPA path has Python branching on ``kv_cache`` / mask presence
+        that would force recompiles. Returns the flat ``(B, T, H_q*D)``
+        attention output (pre o_proj).
+        """
+        bsz, _, seq_len, _ = q.shape
+        if paged_metadata is not None:
+            return self._paged_attention(
+                q, k, v, bsz, seq_len, kv_cache, paged_metadata
+            )
+
+        if kv_cache is not None:
+            k = torch.cat([kv_cache[0], k], dim=2)
+            v = torch.cat([kv_cache[1], v], dim=2)
+        new_kv = (k, v)
+
+        # GQA: expand KV heads to match Q heads
+        if self.num_kv_groups > 1:
+            k = k[:, :, None, :, :].expand(-1, -1, self.num_kv_groups, -1, -1)
+            k = k.reshape(bsz, self.num_heads, -1, self.head_dim)
+            v = v[:, :, None, :, :].expand(-1, -1, self.num_kv_groups, -1, -1)
+            v = v.reshape(bsz, self.num_heads, -1, self.head_dim)
+
+        if attention_mask is not None:
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask)
+        else:
+            is_causal = kv_cache is None and seq_len > 1
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+
+        out = out.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
+        return out, new_kv
+
     def forward(
         self,
         hidden: torch.Tensor,
@@ -265,62 +343,11 @@ class Attention(nn.Module):
             new_kv_cache: (k, v) with updated cache (None in paged mode —
                           the kernel writes directly into the pool).
         """
-        bsz, seq_len, _ = hidden.shape
-
-        # Project Q, K, V and reshape to (batch, heads, seq_len, head_dim)
-        q = (
-            self.q_proj(hidden)
-            .view(bsz, seq_len, self.num_heads, self.head_dim)
-            .transpose(1, 2)
+        q, k, v = self._qkv_with_rope(hidden, cos, sin)
+        attn_flat, new_kv = self._attn_kernel(
+            q, k, v, kv_cache, attention_mask, paged_metadata
         )
-        k = (
-            self.k_proj(hidden)
-            .view(bsz, seq_len, self.num_kv_heads, self.head_dim)
-            .transpose(1, 2)
-        )
-        v = (
-            self.v_proj(hidden)
-            .view(bsz, seq_len, self.num_kv_heads, self.head_dim)
-            .transpose(1, 2)
-        )
-
-        # QK-Norm
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-
-        # RoPE
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
-
-        if paged_metadata is not None:
-            return self._paged_attention(
-                q, k, v, bsz, seq_len, kv_cache, paged_metadata
-            )
-
-        # Append to KV cache
-        if kv_cache is not None:
-            k = torch.cat([kv_cache[0], k], dim=2)
-            v = torch.cat([kv_cache[1], v], dim=2)
-        new_kv = (k, v)
-
-        # GQA: expand KV heads to match Q heads
-        if self.num_kv_groups > 1:
-            k = k[:, :, None, :, :].expand(-1, -1, self.num_kv_groups, -1, -1)
-            k = k.reshape(bsz, self.num_heads, -1, self.head_dim)
-            v = v[:, :, None, :, :].expand(-1, -1, self.num_kv_groups, -1, -1)
-            v = v.reshape(bsz, self.num_heads, -1, self.head_dim)
-
-        # Batched decode passes an explicit float mask; otherwise fall
-        # back to the is_causal kernel path.
-        if attention_mask is not None:
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask)
-        else:
-            is_causal = kv_cache is None and seq_len > 1
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
-
-        # Merge heads → project back
-        out = out.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
-        return self.o_proj(out), new_kv
+        return self.o_proj(attn_flat), new_kv
 
     def _paged_attention(
         self,
@@ -365,7 +392,7 @@ class Attention(nn.Module):
                 causal=True,
             )
             out = out_packed.view(1, seq_len, self.num_heads * head_dim)
-            return self.o_proj(out), None
+            return out, None
 
         _, flash_attn_with_kvcache = _import_flash_attn()
 
@@ -384,7 +411,7 @@ class Attention(nn.Module):
             causal=True,
         )
         out = out.view(bsz, seq_len, self.num_heads * head_dim)
-        return self.o_proj(out), None
+        return out, None
 
 
 # ── MLP ─────────────────────────────────────────────────────────────────
@@ -413,7 +440,14 @@ class MLP(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """Pre-norm transformer layer: LN → Attn → residual → LN → MLP → residual."""
+    """Pre-norm transformer layer: LN → Attn → residual → LN → MLP → residual.
+
+    The forward is split around the opaque flash-attn call into two
+    arithmetic-heavy sub-regions, :meth:`_pre_attn` and :meth:`_post_attn`,
+    so the engine can wrap each one with :func:`torch.compile` and unlock
+    Inductor fusions (RMSNorm-into-GEMM, gate*up*silu, residual epilogs)
+    while leaving the un-traceable flash-attn kernel un-compiled.
+    """
 
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -423,6 +457,42 @@ class TransformerBlock(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+
+    def _pre_attn(
+        self,
+        hidden: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """input_layernorm + Q/K/V projection + QK-Norm + RoPE.
+
+        Bigger than the MLP-only region: 3 GEMMs (Q, K, V) + 3 RMSNorms +
+        RoPE — enough arithmetic to amortize ``torch.compile`` per-call
+        dispatch overhead, with fusion opportunities at the LN→GEMM and
+        QK-Norm→RoPE seams.
+        """
+        h = self.input_layernorm(hidden)
+        return self.self_attn._qkv_with_rope(h, cos, sin)
+
+    def _post_attn(
+        self,
+        attn_flat: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> torch.Tensor:
+        """o_proj + residual + post_attention_layernorm + MLP + residual.
+
+        The largest single contiguous arithmetic region in the layer:
+        4 GEMMs (o_proj, gate, up, down) + 1 RMSNorm + SwiGLU + 2 residual
+        adds. Inductor can fuse o_proj/down_proj epilogs with the residual
+        adds, fuse silu*mul, and fuse the post-norm into the gate/up
+        projection inputs.
+        """
+        h = self.self_attn.o_proj(attn_flat)
+        h = residual + h
+        r = h
+        h = self.post_attention_layernorm(h)
+        h = self.mlp(h)
+        return r + h
 
     def forward(
         self,
@@ -434,18 +504,12 @@ class TransformerBlock(nn.Module):
         paged_metadata: PagedAttentionMetadata | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
         residual = hidden
-        hidden = self.input_layernorm(hidden)
-        hidden, new_kv = self.self_attn(
-            hidden, cos, sin, kv_cache, attention_mask, paged_metadata
+        q, k, v = self._pre_attn(hidden, cos, sin)
+        attn_flat, new_kv = self.self_attn._attn_kernel(
+            q, k, v, kv_cache, attention_mask, paged_metadata
         )
-        hidden = residual + hidden
-
-        residual = hidden
-        hidden = self.post_attention_layernorm(hidden)
-        hidden = self.mlp(hidden)
-        hidden = residual + hidden
-
-        return hidden, new_kv
+        out = self._post_attn(attn_flat, residual)
+        return out, new_kv
 
 
 # ── Full model ──────────────────────────────────────────────────────────

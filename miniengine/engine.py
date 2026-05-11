@@ -13,16 +13,12 @@ Two decode paths (M1):
   - batched_decode(reqs)    : many requests, one forward pass with padded
                               KV + attention mask, used by batched mode
 
-Paged path (M2 Part A):
-  - When `mode == "paged"`, prefill/batched_decode read and write KV
-    through a pre-allocated `KVMemoryPool`. Each request stores a
-    page_table (list of physical page indices) on `req.kv_cache`. On
-    each step we gather pages into a contiguous tensor, run the M1
-    attention path, and scatter only the new last-token K/V back.
-    Real PagedAttention kernels replace the gather/scatter in Part B.
-
-Prefill stays per-request — variable prompt lengths make batched prefill
-complex, and decode is where the throughput gain lives.
+Paged path (M2 Part B):
+  - When `mode == "paged"`, prefill is **packed batched** and decode is
+    **paged batched**. Both paths read/write KV directly through a
+    pre-allocated `KVMemoryPool` via the flash-attn paged kernels — no
+    gather/scatter, no padding. Each request stores a page_table
+    (list of physical page indices) on `req.kv_cache`.
 """
 
 from __future__ import annotations
@@ -35,8 +31,9 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer
 
 from miniengine.core import Request
+from miniengine.cuda_graph_runner import CudaGraphRunner
 from miniengine.kv_memory_pool import KVMemoryPool
-from miniengine.model import CausalLM, ModelConfig, load_weights
+from miniengine.model import CausalLM, ModelConfig, PagedAttentionMetadata, load_weights
 from miniengine.sampler import sample_token
 
 logger = logging.getLogger(__name__)
@@ -53,13 +50,19 @@ class Engine:
         mode: str = "batched",
         page_size: int = 32,
         mem_fraction_static: float = 0.85,
+        torch_compile: bool = False,
+        cuda_graph: bool = False,
+        cuda_graph_batch_sizes: list[int] | None = None,
     ):
         self.device = device
         self.dtype = dtype
         self.mode = mode
         self.page_size = page_size
         self.mem_fraction_static = mem_fraction_static
+        self.torch_compile = torch_compile
+        self.cuda_graph = cuda_graph
         self.pool: KVMemoryPool | None = None
+        self.cuda_graph_runner: CudaGraphRunner | None = None
 
         # ── Tokenizer (still from HF — it's just a tokenizer) ──────────
         logger.info("Loading tokenizer from %s …", model_path)
@@ -101,6 +104,16 @@ class Engine:
                 self.pool.total_kv_tokens,
                 self._pool_bytes() / (1024**3),
             )
+
+        if torch_compile:
+            self._compile_mlp_modules()
+
+        if cuda_graph:
+            if mode != "paged":
+                raise RuntimeError("--cuda-graph requires --mode paged")
+            sizes = cuda_graph_batch_sizes or [1, 2, 4, 8, 16, 32]
+            self.cuda_graph_runner = CudaGraphRunner(self, sizes)
+            self.cuda_graph_runner.capture_all()
 
         # ── Stop tokens ─────────────────────────────────────────────────
         self.stop_token_ids: set[int] = set()
@@ -161,6 +174,28 @@ class Engine:
             * torch.tensor([], dtype=self.dtype).element_size()
         )
 
+    # ── torch.compile of MLP sub-region (M2 Part C) ─────────────────────
+
+    def _compile_mlp_modules(self) -> None:
+        """Wrap each transformer block's MLP with ``torch.compile``.
+
+        ``mode='default'`` with ``dynamic=True`` is chosen over
+        ``'reduce-overhead'`` so the compiled artifacts contain no inner
+        CUDA graphs of their own — that lets us stack cleanly with the
+        outer manual capture in ``CudaGraphRunner`` (CUDA does not allow
+        nested graph capture). The MLP is the most stable sub-region in
+        the decode path: shape ``(B, 1, hidden_size)`` and no Python
+        branching, so dynamo specializes once and Inductor fuses the
+        SwiGLU ``silu(gate(x)) * up(x) → down`` chain into one kernel.
+        """
+        layers = self.model.model.layers
+        for layer in layers:
+            layer.mlp = torch.compile(layer.mlp, mode="default", dynamic=True)
+        logger.info(
+            "torch.compile enabled on MLP of %d layers (mode=default, dynamic=True)",
+            len(layers),
+        )
+
     def _build_pool(self, config: ModelConfig) -> KVMemoryPool:
         if not torch.cuda.is_available() or not str(self.device).startswith("cuda"):
             raise RuntimeError("paged mode currently requires a CUDA device")
@@ -197,7 +232,7 @@ class Engine:
 
     def prefill(self, request: Request) -> int:
         if self.mode == "paged":
-            return self._prefill_paged(request)
+            return self.batched_prefill([request])[0]
         return self._prefill_classic(request)
 
     @torch.inference_mode()
@@ -226,28 +261,83 @@ class Engine:
             logits[:, -1, :], request.sampling_params, request.output_ids
         )
 
+    def batched_prefill(self, requests: list[Request]) -> list[int]:
+        """Packed batched prefill (paged mode only).
+
+        Flattens N prompts into one packed sequence of length ``T = ΣL_i``,
+        runs a single ``flash_attn_varlen_func`` forward pass, scatters the
+        per-token K/V into each request's pages via a slot mapping, and
+        samples the first output token of every request from the last
+        position of each prompt's logits.
+        """
+        if not requests:
+            return []
+        if self.mode != "paged":
+            raise RuntimeError("batched_prefill is only available in paged mode")
+        return self._batched_prefill_paged(requests)
+
     @torch.inference_mode()
-    def _prefill_paged(self, request: Request) -> int:
-        """Paged prefill: write the full prompt KV directly into the pool."""
+    def _batched_prefill_paged(self, requests: list[Request]) -> list[int]:
         assert self.pool is not None, "paged prefill requires a KV pool"
-        page_table = request.kv_cache
-        assert isinstance(page_table, list), (
-            "paged prefill expects req.kv_cache to be a page_table allocated "
-            "by the scheduler before prefill is called"
-        )
+
+        prompt_lens = [req.num_input_tokens for req in requests]
+        max_seqlen = max(prompt_lens)
+
+        packed_ids: list[int] = []
+        position_chunks: list[int] = []
+        slot_mapping_list: list[int] = []
+        cu = [0]
+        for req, L in zip(requests, prompt_lens):
+            page_table = req.kv_cache
+            assert isinstance(page_table, list), (
+                "paged prefill expects req.kv_cache to be a page_table "
+                "allocated by the scheduler before prefill is called"
+            )
+            packed_ids.extend(req.input_ids)
+            position_chunks.extend(range(L))
+            slot_mapping_list.extend(
+                self.pool.slot_mapping_for_prefill(page_table, 0, L)
+            )
+            cu.append(cu[-1] + L)
 
         input_ids = torch.tensor(
-            [request.input_ids], dtype=torch.long, device=self.device
+            packed_ids, dtype=torch.long, device=self.device
+        ).unsqueeze(0)
+        position_ids = torch.tensor(
+            position_chunks, dtype=torch.long, device=self.device
+        ).unsqueeze(0)
+        cu_seqlens = torch.tensor(cu, dtype=torch.int32, device=self.device)
+        slot_mapping = torch.tensor(
+            slot_mapping_list, dtype=torch.long, device=self.device
         )
-        seq_len = input_ids.shape[1]
-        position_ids = torch.arange(seq_len, device=self.device).unsqueeze(0)
+        last_token_indices = cu_seqlens[1:].to(torch.long) - 1
 
-        logits, kv_caches = self.model(input_ids, position_ids, kv_caches=None)
-        self._scatter_kv_into_pages(page_table, start_pos=0, new_kv=kv_caches)
-
-        return sample_token(
-            logits[:, -1, :], request.sampling_params, request.output_ids
+        meta = PagedAttentionMetadata(
+            is_prefill=True,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            slot_mapping=slot_mapping,
         )
+        kv_caches = [
+            (self.pool.k_cache(i), self.pool.v_cache(i))
+            for i in range(self.pool.num_layers)
+        ]
+        logits, _ = self.model(
+            input_ids,
+            position_ids,
+            kv_caches=kv_caches,
+            paged_metadata=meta,
+            last_token_indices=last_token_indices,
+        )
+
+        token_ids: list[int] = []
+        for i, req in enumerate(requests):
+            token_ids.append(
+                sample_token(
+                    logits[:, i, :], req.sampling_params, req.output_ids
+                )
+            )
+        return token_ids
 
     @torch.inference_mode()
     def decode_step(self, request: Request) -> int:
@@ -387,118 +477,90 @@ class Engine:
 
     @torch.inference_mode()
     def _batched_decode_paged(self, requests: list[Request]) -> list[int]:
-        """Paged batched decode.
+        """Paged batched decode via ``flash_attn_with_kvcache``.
 
-        Each request's KV lives in pool pages addressed by req.kv_cache
-        (a list[int] page table). We gather pages into a padded
-        contiguous KV per layer, run the M1 batched SDPA path, then
-        scatter only the new last-token K/V back into the next page
-        slot of every request. Part B replaces gather/scatter with a
-        real paged-attention kernel.
+        Stacks one new token per request into ``(B, 1)``, builds a dense
+        ``block_table`` and ``cache_seqlens`` from the per-request page
+        tables, and runs a single batched forward. The kernel itself
+        appends each request's new K/V at slot ``cache_seqlens[b]`` of
+        the request's pages and gathers the full prefix for attention.
+
+        When a ``CudaGraphRunner`` is available and the live batch fits a
+        captured bucket, the model forward is replayed from a captured
+        graph instead of issued op-by-op.
         """
         if not requests:
             return []
         assert self.pool is not None, "paged decode requires a KV pool"
 
         batch_size = len(requests)
-        num_layers = self.pool.num_layers
-        page_size = self.pool.page_size
-
-        input_ids = torch.tensor(
-            [[req.output_ids[-1]] for req in requests],
-            dtype=torch.long,
-            device=self.device,
-        )
-
         page_tables: list[list[int]] = [req.kv_cache for req in requests]
         cache_lens = [self._paged_kv_length(req) for req in requests]
-        max_cache_len = max(cache_lens)
-        position_ids = torch.tensor(
-            [[cl] for cl in cache_lens], dtype=torch.long, device=self.device
+        max_pages = max(len(pt) for pt in page_tables)
+        max_position = max(cache_lens)
+
+        runner = self.cuda_graph_runner
+        use_graph = runner is not None and runner.covers(
+            batch_size, max_pages, max_position
         )
 
-        # Build (page_idx, slot) grids covering positions [0, max_cache_len)
-        # for every request. Positions ≥ cache_len[b] are dummies — they
-        # will be masked out by attention_mask. Doing this on CPU first
-        # avoids a tensor op per (request, position).
-        page_idx_rows: list[list[int]] = []
-        for b in range(batch_size):
-            pt = page_tables[b]
-            cl = cache_lens[b]
-            row: list[int] = []
-            cur_page = pt[0]
-            last_block = -1
-            for t in range(max_cache_len):
-                if t < cl:
-                    block = t // page_size
-                    if block != last_block:
-                        cur_page = pt[block]
-                        last_block = block
-                    row.append(cur_page)
-                else:
-                    row.append(0)
-            page_idx_rows.append(row)
-        page_idx_grid = torch.tensor(
-            page_idx_rows, device=self.device, dtype=torch.long
-        )
-        slot_grid = (
-            torch.arange(max_cache_len, device=self.device, dtype=torch.long)
-            .unsqueeze(0)
-            .expand(batch_size, -1)
-            % page_size
-        )
+        if use_graph:
+            assert runner is not None
+            bucket = runner.bucket_for(batch_size)
+            scratch = runner.scratch_page
+            input_ids = torch.zeros((bucket, 1), dtype=torch.long, device=self.device)
+            position_ids = torch.zeros((bucket, 1), dtype=torch.long, device=self.device)
+            cache_seqlens = torch.ones((bucket,), dtype=torch.int32, device=self.device)
+            block_table = torch.full(
+                (bucket, runner.max_pages_per_seq),
+                scratch,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            for i, req in enumerate(requests):
+                input_ids[i, 0] = req.output_ids[-1]
+                position_ids[i, 0] = cache_lens[i]
+                cache_seqlens[i] = cache_lens[i]
+                pt = page_tables[i]
+                block_table[i, : len(pt)] = torch.as_tensor(
+                    pt, dtype=torch.int32, device=self.device
+                )
+            logits, _ = runner.replay(
+                input_ids, position_ids, block_table, cache_seqlens
+            )
+        else:
+            input_ids = torch.tensor(
+                [[req.output_ids[-1]] for req in requests],
+                dtype=torch.long,
+                device=self.device,
+            )
+            position_ids = torch.tensor(
+                [[cl] for cl in cache_lens], dtype=torch.long, device=self.device
+            )
+            cache_seqlens = torch.tensor(
+                cache_lens, dtype=torch.int32, device=self.device
+            )
+            block_table = torch.tensor(
+                self.pool.pad_block_table(page_tables, max_pages),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            meta = PagedAttentionMetadata(
+                is_prefill=False,
+                block_table=block_table,
+                cache_seqlens=cache_seqlens,
+            )
+            kv_caches = [
+                (self.pool.k_cache(i), self.pool.v_cache(i))
+                for i in range(self.pool.num_layers)
+            ]
+            logits, _ = self.model(
+                input_ids,
+                position_ids,
+                kv_caches=kv_caches,
+                paged_metadata=meta,
+            )
 
-        # Gather: (batch, max_cache_len, kv_heads, head_dim) → permute to
-        # (batch, kv_heads, max_cache_len, head_dim) matching the M1 layout.
-        padded_kv_caches: list[tuple[torch.Tensor, torch.Tensor]] = []
-        for layer_idx in range(num_layers):
-            k_pool = self.pool.k_cache(layer_idx)
-            v_pool = self.pool.v_cache(layer_idx)
-            k_gathered = k_pool[page_idx_grid, slot_grid].permute(0, 2, 1, 3).contiguous()
-            v_gathered = v_pool[page_idx_grid, slot_grid].permute(0, 2, 1, 3).contiguous()
-            padded_kv_caches.append((k_gathered, v_gathered))
-
-        # Mask shape (batch, 1, 1, max_cache_len + 1): the attention forward
-        # appends the new token to the cache, so kv_len = max_cache_len + 1.
-        attention_mask = torch.zeros(
-            batch_size,
-            1,
-            1,
-            max_cache_len + 1,
-            device=self.device,
-            dtype=self.dtype,
-        )
-        for i, cl in enumerate(cache_lens):
-            attention_mask[i, 0, 0, cl:max_cache_len] = float("-inf")
-
-        logits, new_kv_caches = self.model(
-            input_ids,
-            position_ids,
-            kv_caches=padded_kv_caches,
-            attention_mask=attention_mask,
-        )
-
-        # Scatter the new last-token K/V back into each request's next slot.
-        # Pre-compute (page_idx, slot) per request once, then write all
-        # layers in vectorized fashion.
-        next_page_idx = torch.tensor(
-            [page_tables[i][cache_lens[i] // page_size] for i in range(batch_size)],
-            device=self.device,
-            dtype=torch.long,
-        )
-        next_slot = torch.tensor(
-            [cache_lens[i] % page_size for i in range(batch_size)],
-            device=self.device,
-            dtype=torch.long,
-        )
-        for layer_idx in range(num_layers):
-            # new_kv_caches[layer][0]: (batch, kv_heads, max_cache_len+1, head_dim)
-            k_new = new_kv_caches[layer_idx][0][:, :, -1, :].contiguous()
-            v_new = new_kv_caches[layer_idx][1][:, :, -1, :].contiguous()
-            self.pool.k_cache(layer_idx)[next_page_idx, next_slot] = k_new
-            self.pool.v_cache(layer_idx)[next_page_idx, next_slot] = v_new
-
-        # Sample
         token_ids: list[int] = []
         for i, req in enumerate(requests):
             token_ids.append(
@@ -507,38 +569,3 @@ class Engine:
                 )
             )
         return token_ids
-
-    # ── Page scatter helper (prefill) ───────────────────────────────────
-
-    def _scatter_kv_into_pages(
-        self,
-        page_table: list[int],
-        start_pos: int,
-        new_kv: list[tuple[torch.Tensor, torch.Tensor]],
-    ) -> None:
-        """Write a chunk of newly computed K/V into the pool.
-
-        new_kv[layer] = (k, v) with shape (1, kv_heads, n_new, head_dim).
-        The chunk maps onto positions [start_pos, start_pos + n_new) in
-        the request's logical KV stream; each is routed to
-        page_table[pos // page_size] at slot pos % page_size.
-        """
-        assert self.pool is not None
-        n_new = new_kv[0][0].shape[2]
-        if n_new == 0:
-            return
-        ps = self.pool.page_size
-        positions = torch.arange(
-            start_pos, start_pos + n_new, device=self.device, dtype=torch.long
-        )
-        slot = positions % ps
-        page_table_t = torch.tensor(
-            page_table, device=self.device, dtype=torch.long
-        )
-        page_idx = page_table_t[positions // ps]
-
-        for layer_idx, (k, v) in enumerate(new_kv):
-            k_flat = k.squeeze(0).transpose(0, 1).contiguous()
-            v_flat = v.squeeze(0).transpose(0, 1).contiguous()
-            self.pool.k_cache(layer_idx)[page_idx, slot] = k_flat
-            self.pool.v_cache(layer_idx)[page_idx, slot] = v_flat

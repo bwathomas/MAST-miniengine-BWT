@@ -64,6 +64,24 @@ def parse_args() -> argparse.Namespace:
         default=32,
         help="Tokens per KV page. Only used when --mode paged.",
     )
+    p.add_argument(
+        "--torch-compile",
+        action="store_true",
+        help="Apply torch.compile to the MLP sub-region (M2 Part C required).",
+    )
+    p.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help="Capture & replay paged-decode forward via CUDA graphs "
+        "(M2 Part C extra credit). Requires --mode paged.",
+    )
+    p.add_argument(
+        "--cuda-graph-batch-sizes",
+        type=str,
+        default="1,2,4,8,16,32",
+        help="Comma-separated bucket batch sizes to capture when "
+        "--cuda-graph is set; live batches are rounded UP to the nearest.",
+    )
     return p.parse_args()
 
 
@@ -85,6 +103,9 @@ def main() -> None:
         args.mode,
     )
 
+    cuda_graph_batch_sizes = [
+        int(x) for x in args.cuda_graph_batch_sizes.split(",") if x.strip()
+    ]
     engine = Engine(
         model_path=args.model,
         dtype=dtype,
@@ -92,6 +113,9 @@ def main() -> None:
         mode=args.mode,
         page_size=args.page_size,
         mem_fraction_static=args.mem_fraction_static,
+        torch_compile=args.torch_compile,
+        cuda_graph=args.cuda_graph,
+        cuda_graph_batch_sizes=cuda_graph_batch_sizes,
     )
     sched = Scheduler(engine=engine, max_running=args.max_running, mode=args.mode)
 

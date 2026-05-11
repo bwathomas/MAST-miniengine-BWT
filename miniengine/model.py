@@ -27,6 +27,28 @@ import torch.nn.functional as F
 logger = logging.getLogger(__name__)
 
 
+# ── Paged attention metadata ────────────────────────────────────────────
+
+
+@dataclass
+class PagedAttentionMetadata:
+    """Per-step metadata for the paged attention kernels.
+
+    `is_prefill=True` selects ``flash_attn_varlen_func`` and consumes
+    `cu_seqlens`, `max_seqlen`, `slot_mapping`. `is_prefill=False` selects
+    ``flash_attn_with_kvcache`` and consumes `block_table`, `cache_seqlens`.
+    The kernels read/write the per-layer pool tensors that the engine passes
+    in as `kv_caches[i] = (pool.k_cache(i), pool.v_cache(i))`.
+    """
+
+    is_prefill: bool
+    cu_seqlens: torch.Tensor | None = None
+    max_seqlen: int = 0
+    slot_mapping: torch.Tensor | None = None
+    block_table: torch.Tensor | None = None
+    cache_seqlens: torch.Tensor | None = None
+
+
 # ── Config ──────────────────────────────────────────────────────────────
 
 
@@ -200,20 +222,28 @@ class Attention(nn.Module):
         sin: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
         attention_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        paged_metadata: PagedAttentionMetadata | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
         """
         Args:
             hidden:         (batch, seq_len, hidden_size)
             cos, sin:       from RotaryEmbedding, broadcastable
-            kv_cache:       optional (cached_k, cached_v), each
-                            (batch, num_kv_heads, cache_len, head_dim)
+            kv_cache:       in non-paged mode, optional (cached_k, cached_v)
+                            each (batch, num_kv_heads, cache_len, head_dim);
+                            in paged mode, the layer's pool (k, v) tensors of
+                            shape (num_pages, page_size, num_kv_heads, head_dim).
             attention_mask: optional float mask (batch, 1, q_len, kv_len)
                             for batched decode with padded KV; 0 = attend,
                             -inf = ignore.
+            paged_metadata: when set, take the PagedAttention path
+                            (flash-attn varlen for prefill,
+                            flash_attn_with_kvcache for decode); kv_cache is
+                            then the layer's pool (k_pool, v_pool).
 
         Returns:
             output:       (batch, seq_len, hidden_size)
-            new_kv_cache: (k, v) with updated cache
+            new_kv_cache: (k, v) with updated cache (None in paged mode —
+                          the kernel writes directly into the pool).
         """
         bsz, seq_len, _ = hidden.shape
 
@@ -242,6 +272,11 @@ class Attention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
 
+        if paged_metadata is not None:
+            return self._paged_attention(
+                q, k, v, bsz, seq_len, kv_cache, paged_metadata
+            )
+
         # Append to KV cache
         if kv_cache is not None:
             k = torch.cat([kv_cache[0], k], dim=2)
@@ -266,6 +301,70 @@ class Attention(nn.Module):
         # Merge heads → project back
         out = out.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
         return self.o_proj(out), new_kv
+
+    def _paged_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        bsz: int,
+        seq_len: int,
+        kv_cache: tuple[torch.Tensor, torch.Tensor] | None,
+        meta: PagedAttentionMetadata,
+    ) -> tuple[torch.Tensor, None]:
+        assert kv_cache is not None, "paged attention requires the pool's (k, v) tensors"
+        k_pool, v_pool = kv_cache
+        num_kv_heads = self.num_kv_heads
+        head_dim = self.head_dim
+
+        if meta.is_prefill:
+            from flash_attn import flash_attn_varlen_func
+
+            # (1, H, T, D) → (T, H, D) packed layout the varlen kernel wants.
+            q_packed = q.squeeze(0).transpose(0, 1).contiguous()
+            k_packed = k.squeeze(0).transpose(0, 1).contiguous()
+            v_packed = v.squeeze(0).transpose(0, 1).contiguous()
+
+            # Scatter freshly computed K/V into the pool at the requested
+            # physical slots (PagedAttention §4.3 Fig. 6).
+            k_pool.view(-1, num_kv_heads, head_dim).index_copy_(
+                0, meta.slot_mapping, k_packed
+            )
+            v_pool.view(-1, num_kv_heads, head_dim).index_copy_(
+                0, meta.slot_mapping, v_packed
+            )
+
+            out_packed = flash_attn_varlen_func(
+                q_packed,
+                k_packed,
+                v_packed,
+                cu_seqlens_q=meta.cu_seqlens,
+                cu_seqlens_k=meta.cu_seqlens,
+                max_seqlen_q=meta.max_seqlen,
+                max_seqlen_k=meta.max_seqlen,
+                causal=True,
+            )
+            out = out_packed.view(1, seq_len, self.num_heads * head_dim)
+            return self.o_proj(out), None
+
+        from flash_attn import flash_attn_with_kvcache
+
+        q_dec = q.transpose(1, 2).contiguous()
+        k_new = k.transpose(1, 2).contiguous()
+        v_new = v.transpose(1, 2).contiguous()
+
+        out = flash_attn_with_kvcache(
+            q_dec,
+            k_pool,
+            v_pool,
+            k=k_new,
+            v=v_new,
+            cache_seqlens=meta.cache_seqlens,
+            block_table=meta.block_table,
+            causal=True,
+        )
+        out = out.view(bsz, seq_len, self.num_heads * head_dim)
+        return self.o_proj(out), None
 
 
 # ── MLP ─────────────────────────────────────────────────────────────────
@@ -312,10 +411,13 @@ class TransformerBlock(nn.Module):
         sin: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
         attention_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        paged_metadata: PagedAttentionMetadata | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
         residual = hidden
         hidden = self.input_layernorm(hidden)
-        hidden, new_kv = self.self_attn(hidden, cos, sin, kv_cache, attention_mask)
+        hidden, new_kv = self.self_attn(
+            hidden, cos, sin, kv_cache, attention_mask, paged_metadata
+        )
         hidden = residual + hidden
 
         residual = hidden
@@ -347,25 +449,33 @@ class TransformerModel(nn.Module):
         position_ids: torch.Tensor,
         kv_caches: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         attention_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
+        paged_metadata: PagedAttentionMetadata | None = None,
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor] | None]]:
         """
         Args:
             input_ids:      (batch, seq_len)
             position_ids:   (batch, seq_len)
-            kv_caches:      list of per-layer (key, value) caches, or None
+            kv_caches:      list of per-layer (key, value) caches, or None.
+                            In paged mode this is the pool's per-layer
+                            (k, v) tensors.
             attention_mask: optional float mask for batched-decode SDPA
+            paged_metadata: optional metadata that switches every layer to
+                            the PagedAttention path (flash-attn).
 
         Returns:
             hidden:         (batch, seq_len, hidden_size)
-            new_kv_caches:  list of per-layer (key, value) with appended tokens
+            new_kv_caches:  list of per-layer (key, value) with appended
+                            tokens (each entry is None in paged mode).
         """
         hidden = self.embed_tokens(input_ids)
         cos, sin = self.rotary_emb(position_ids)
 
-        new_kv_caches: list[tuple[torch.Tensor, torch.Tensor]] = []
+        new_kv_caches: list[tuple[torch.Tensor, torch.Tensor] | None] = []
         for i, layer in enumerate(self.layers):
             kv = kv_caches[i] if kv_caches is not None else None
-            hidden, new_kv = layer(hidden, cos, sin, kv, attention_mask)
+            hidden, new_kv = layer(
+                hidden, cos, sin, kv, attention_mask, paged_metadata
+            )
             new_kv_caches.append(new_kv)
 
         hidden = self.norm(hidden)
@@ -392,15 +502,25 @@ class CausalLM(nn.Module):
         position_ids: torch.Tensor,
         kv_caches: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         attention_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
+        paged_metadata: PagedAttentionMetadata | None = None,
+        last_token_indices: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor] | None]]:
         """
+        Args:
+            last_token_indices: optional 1-D index tensor selecting positions
+                along ``seq_len`` *before* the LM head. Used by packed prefill
+                to avoid materialising ``(1, T, vocab)`` logits when only the
+                last position of each prompt is needed.
+
         Returns:
-            logits:        (batch, seq_len, vocab_size)
-            new_kv_caches: per-layer KV caches
+            logits:        (batch, seq_len_or_selected, vocab_size)
+            new_kv_caches: per-layer KV caches (entries are None in paged mode)
         """
         hidden, new_kv_caches = self.model(
-            input_ids, position_ids, kv_caches, attention_mask
+            input_ids, position_ids, kv_caches, attention_mask, paged_metadata
         )
+        if last_token_indices is not None:
+            hidden = hidden[:, last_token_indices, :]
         if self.config.tie_word_embeddings:
             logits = F.linear(hidden, self.model.embed_tokens.weight)
         else:

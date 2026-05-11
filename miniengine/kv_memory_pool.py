@@ -128,6 +128,40 @@ class KVMemoryPool:
     def v_cache(self, layer_idx: int) -> torch.Tensor:
         return self._v_caches[layer_idx]
 
+    def slot_mapping_for_prefill(
+        self,
+        page_table: list[int],
+        start_pos: int,
+        length: int,
+    ) -> list[int]:
+        """Per-token flat indices for writing K/V into the pool.
+
+        Returns ``[page_table[t // page_size] * page_size + (t % page_size)
+        for t in [start_pos, start_pos + length)]`` — the flat-index form
+        the paged-attention prefill kernel uses to scatter freshly computed
+        K/V into the request's pages (PagedAttention §4.3, Fig. 6).
+        """
+        if length <= 0:
+            return []
+        ps = self.page_size
+        return [
+            page_table[t // ps] * ps + (t % ps)
+            for t in range(start_pos, start_pos + length)
+        ]
+
+    @staticmethod
+    def pad_block_table(
+        page_tables: list[list[int]], max_pages: int
+    ) -> list[list[int]]:
+        """Pad per-request page tables out to a common length.
+
+        The decode kernel takes a dense ``(B, max_pages_per_seq)`` block
+        table; rows for shorter requests are padded with ``0``s. Padding
+        entries are never read because the kernel's row scan is upper-
+        bounded by ``cache_seqlens[b] + 1``.
+        """
+        return [pt + [0] * (max_pages - len(pt)) for pt in page_tables]
+
     @classmethod
     def from_budget(
         cls,

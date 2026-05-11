@@ -186,15 +186,17 @@ class Scheduler:
                 req.kv_cache = pool.allocate(needed)
                 to_prefill.append(req)
 
-        for req in to_prefill:
-            req.status = RequestStatus.RUNNING
-            token_id = self.engine.prefill(req)
-            req.output_ids.append(token_id)
-            self._stream_token(req, token_id)
-            if self._check_finished(req, token_id):
-                self._finish_request(req, finished)
-            else:
-                self.running.append(req)
+        if to_prefill:
+            for req in to_prefill:
+                req.status = RequestStatus.RUNNING
+            token_ids = self.engine.batched_prefill(to_prefill)
+            for req, token_id in zip(to_prefill, token_ids):
+                req.output_ids.append(token_id)
+                self._stream_token(req, token_id)
+                if self._check_finished(req, token_id):
+                    self._finish_request(req, finished)
+                else:
+                    self.running.append(req)
 
         if self.running:
             token_ids = self.engine.batched_decode(self.running)

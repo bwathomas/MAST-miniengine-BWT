@@ -16,13 +16,17 @@ dependencies = [
     "uvicorn[standard]>=0.27.0",
     "pydantic>=2.0.0",
     "aiohttp>=3.9.0",
-    "flash-attn>=2.5.0",
 ]
 
 [project.optional-dependencies]
 bench = [
     "numpy",
     "tqdm",
+]
+# `paged` enables --mode paged (M2 Part B). flash-attn from source can take
+# 30-60 min to build; the Colab notebook installs a prebuilt wheel instead.
+paged = [
+    "flash-attn>=2.5.0",
 ]
 
 [project.scripts]

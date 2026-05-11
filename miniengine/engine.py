@@ -33,7 +33,13 @@ from transformers import AutoTokenizer
 from miniengine.core import Request
 from miniengine.cuda_graph_runner import CudaGraphRunner
 from miniengine.kv_memory_pool import KVMemoryPool
-from miniengine.model import CausalLM, ModelConfig, PagedAttentionMetadata, load_weights
+from miniengine.model import (
+    CausalLM,
+    ModelConfig,
+    PagedAttentionMetadata,
+    _import_flash_attn,
+    load_weights,
+)
 from miniengine.sampler import sample_token
 
 logger = logging.getLogger(__name__)
@@ -95,6 +101,7 @@ class Engine:
         self.config = config
 
         if mode == "paged":
+            _import_flash_attn()  # fail fast at startup if flash-attn is missing
             self.pool = self._build_pool(config)
             logger.info(
                 "KV pool ready  —  pages=%d, page_size=%d, "

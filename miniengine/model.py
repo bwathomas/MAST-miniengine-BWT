@@ -27,6 +27,26 @@ import torch.nn.functional as F
 logger = logging.getLogger(__name__)
 
 
+_FLASH_ATTN_INSTALL_HINT = (
+    "flash-attn is required for --mode paged but is not installed. Install a "
+    "prebuilt wheel matching your torch/CUDA/Python from "
+    "https://github.com/Dao-AILab/flash-attention/releases (recommended), or "
+    "build from source with `pip install -e \".[paged]\"` (slow). See the "
+    "Colab notebook's `(Optional) Install flash-attn` cell for an auto-"
+    "detected wheel URL."
+)
+
+
+def _import_flash_attn():
+    """Lazy-import flash_attn with an actionable error if it's missing."""
+    try:
+        import flash_attn  # noqa: F401
+        from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+    except ImportError as e:
+        raise ImportError(_FLASH_ATTN_INSTALL_HINT) from e
+    return flash_attn_varlen_func, flash_attn_with_kvcache
+
+
 # ── Paged attention metadata ────────────────────────────────────────────
 
 
@@ -318,7 +338,7 @@ class Attention(nn.Module):
         head_dim = self.head_dim
 
         if meta.is_prefill:
-            from flash_attn import flash_attn_varlen_func
+            flash_attn_varlen_func, _ = _import_flash_attn()
 
             # (1, H, T, D) → (T, H, D) packed layout the varlen kernel wants.
             q_packed = q.squeeze(0).transpose(0, 1).contiguous()
@@ -347,7 +367,7 @@ class Attention(nn.Module):
             out = out_packed.view(1, seq_len, self.num_heads * head_dim)
             return self.o_proj(out), None
 
-        from flash_attn import flash_attn_with_kvcache
+        _, flash_attn_with_kvcache = _import_flash_attn()
 
         q_dec = q.transpose(1, 2).contiguous()
         k_new = k.transpose(1, 2).contiguous()

@@ -71,6 +71,7 @@ class Engine:
         lpt_reorder: bool = False,
         rope_cache_cap: int = DEFAULT_ROPE_CACHE_CAP,
         prefill_token_budget: int = 0,
+        recompute_recovery: bool = False,
     ):
         if mode == "paged":
             align = self._FLASH_ATTN_PAGE_ALIGNMENT
@@ -98,6 +99,7 @@ class Engine:
         self.lpt_reorder: bool = bool(lpt_reorder)
         self.rope_cache_cap: int = int(rope_cache_cap)
         self.prefill_token_budget: int = int(prefill_token_budget)
+        self.recompute_recovery: bool = bool(recompute_recovery)
 
         # ── Tokenizer (still from HF — it's just a tokenizer) ──────────
         logger.info("Loading tokenizer from %s …", model_path)

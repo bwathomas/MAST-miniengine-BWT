@@ -68,14 +68,22 @@ class KVMemoryPool:
         ]
 
         self._free: deque[int] = deque(range(num_pages))
+        # Per-page refcount (PagedAttention §4.4). 0 = free, 1 = owned by
+        # one request, >1 = shared (e.g. a prefix-cache hit aliasing the
+        # same physical page to multiple sequences). ``free()`` decrements;
+        # a page returns to the free list only when it hits 0. With no
+        # explicit acquire() calls every allocation behaves exactly like
+        # the prior unique-owner pool, so existing call sites are unchanged.
+        self._refcount: list[int] = [0] * num_pages
 
     def allocate(self, num_pages: int) -> list[int]:
         """Reserve `num_pages` pages and return their indices.
 
-        Raises ``RuntimeError`` if the free list is too short to satisfy
-        the request — callers (the scheduler) are expected to check
-        :pyattr:`num_free` first when they want a deterministic admission
-        decision rather than an exception.
+        Each returned page has refcount=1. Raises ``RuntimeError`` if the
+        free list is too short to satisfy the request — callers (the
+        scheduler) are expected to check :pyattr:`num_free` first when
+        they want a deterministic admission decision rather than an
+        exception.
         """
         if num_pages < 0:
             raise ValueError(f"num_pages must be non-negative, got {num_pages}")
@@ -84,12 +92,45 @@ class KVMemoryPool:
                 f"KV pool exhausted: requested {num_pages} pages, "
                 f"only {len(self._free)} free of {self.num_pages}"
             )
-        return [self._free.popleft() for _ in range(num_pages)]
+        out: list[int] = []
+        for _ in range(num_pages):
+            p = self._free.popleft()
+            self._refcount[p] = 1
+            out.append(p)
+        return out
+
+    def acquire(self, page_indices: list[int]) -> None:
+        """Increment refcount on already-allocated pages.
+
+        Intended for a prefix-cache layer that wants to share a physical
+        page across multiple requests (PagedAttention §4.4). Asserts each
+        page is currently held by at least one owner; aliasing a free page
+        would race with a future :meth:`allocate`.
+        """
+        for p in page_indices:
+            if self._refcount[p] <= 0:
+                raise RuntimeError(
+                    f"acquire() on free page {p} (refcount=0); pages must "
+                    f"be allocated before they can be shared"
+                )
+            self._refcount[p] += 1
 
     def free(self, page_indices: list[int]) -> None:
-        """Return the listed pages to the free pool."""
+        """Decrement refcount on the listed pages; release at refcount=0."""
         for p in page_indices:
-            self._free.append(p)
+            rc = self._refcount[p]
+            if rc <= 0:
+                raise RuntimeError(
+                    f"free() on already-free page {p} (refcount={rc})"
+                )
+            rc -= 1
+            self._refcount[p] = rc
+            if rc == 0:
+                self._free.append(p)
+
+    def refcount(self, page_idx: int) -> int:
+        """How many requests currently hold this page (0 if free)."""
+        return self._refcount[page_idx]
 
     def pages_needed(self, seq_len: int) -> int:
         """How many pages are required to store `seq_len` tokens."""

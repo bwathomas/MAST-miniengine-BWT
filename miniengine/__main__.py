@@ -117,6 +117,14 @@ def parse_args() -> argparse.Namespace:
         "prefill at this many prompt tokens per step; spillover defers "
         "to the next step. 0 = no cap.",
     )
+    p.add_argument(
+        "--recompute-recovery",
+        action="store_true",
+        help="On KV pool exhaustion, evict the running request with the "
+        "smallest output progress, fold its sampled outputs into a new "
+        "prefill, and re-admit (PagedAttention §4.5). Default off keeps "
+        "the FCFS-wait behaviour.",
+    )
     return p.parse_args()
 
 
@@ -155,6 +163,7 @@ def main() -> None:
         lpt_reorder=args.lpt_reorder,
         rope_cache_cap=args.rope_cache_cap,
         prefill_token_budget=args.prefill_token_budget,
+        recompute_recovery=args.recompute_recovery,
     )
     sched = Scheduler(engine=engine, max_running=args.max_running, mode=args.mode)
 

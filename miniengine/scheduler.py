@@ -168,10 +168,15 @@ class Scheduler:
         # prefill-step latency, which on L4 dominates TTFT spikes when a
         # large bursts admits 8+ long prompts in one step.
         prefill_budget = int(getattr(self.engine, "prefill_token_budget", 0))
+        recompute_recovery = bool(getattr(self.engine, "recompute_recovery", False))
 
         with self._lock:
             to_prefill: list[Request] = []
             packed_tokens = 0
+            # Bound recompute-eviction work to one pass over the running set
+            # per step (PagedAttention §4.5). Without this cap a single
+            # oversized head could thrash through every running request.
+            evictions_remaining = len(self.running) if recompute_recovery else 0
             while (
                 self.waiting and len(self.running) + len(to_prefill) < self.max_running
             ):
@@ -189,6 +194,14 @@ class Scheduler:
                     )
                     continue
                 if needed > pool.num_free:
+                    if (
+                        recompute_recovery
+                        and self.running
+                        and evictions_remaining > 0
+                    ):
+                        if self._evict_lowest_progress():
+                            evictions_remaining -= 1
+                            continue
                     break
                 if (
                     prefill_budget > 0
@@ -333,3 +346,46 @@ class Scheduler:
         ):
             self.engine.pool.free(req.kv_cache)
         req.kv_cache = None
+
+    def _evict_lowest_progress(self) -> bool:
+        """Recompute-recovery (PagedAttention §4.5) eviction.
+
+        Pick the running request with the *smallest* output-token count
+        (least lost work), free its pages back to the pool, fold any
+        streamed output tokens into its input_ids so a future re-prefill
+        rebuilds the same K/V state, decrement the remaining max_new
+        budget by what was already streamed, and put it back on the
+        waiting queue head so it's re-admitted as soon as pages are free.
+
+        Returns True iff a victim was evicted (caller can retry head
+        admission); False if there was nothing to evict.
+
+        The client-visible stream is preserved: tokens already pushed via
+        ``token_queue`` are not duplicated, and the post-recompute first
+        sample is the request's (N+1)th total output as in the no-eviction
+        case (just with a fresh roll of the sampler).
+        """
+        if self.mode != "paged" or self.engine.pool is None or not self.running:
+            return False
+        victim = min(self.running, key=lambda r: r.num_output_tokens)
+        self.running.remove(victim)
+        if isinstance(victim.kv_cache, list) and victim.kv_cache:
+            self.engine.pool.free(victim.kv_cache)
+        folded = len(victim.output_ids)
+        if folded:
+            victim.input_ids = list(victim.input_ids) + list(victim.output_ids)
+            victim.sampling_params.max_new_tokens -= folded
+            victim.output_ids = []
+        victim.kv_cache = None
+        victim.status = RequestStatus.WAITING
+        self.waiting.appendleft(victim)
+        logger.info(
+            "Recompute-recovery: evicted req %s (folded %d streamed tokens "
+            "into prompt, %d max_new remaining, %d running, %d waiting)",
+            victim.request_id,
+            folded,
+            victim.sampling_params.max_new_tokens,
+            len(self.running),
+            len(self.waiting),
+        )
+        return True

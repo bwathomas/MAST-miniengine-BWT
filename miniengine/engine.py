@@ -48,18 +48,32 @@ logger = logging.getLogger(__name__)
 class Engine:
     """Model wrapper supporting baseline (per-request) and batched decode."""
 
+    # flash-attn 2.8+ requires the paged KV block size to be a multiple of
+    # this. Hitting this from the kernel itself produces a cryptic error
+    # mid-decode, so we validate at startup.
+    _FLASH_ATTN_PAGE_ALIGNMENT = 256
+
     def __init__(
         self,
         model_path: str,
         dtype: torch.dtype = torch.bfloat16,
         device: str = "cuda",
         mode: str = "batched",
-        page_size: int = 32,
+        page_size: int = 256,
         mem_fraction_static: float = 0.85,
         torch_compile: bool = False,
         cuda_graph: bool = False,
         cuda_graph_batch_sizes: list[int] | None = None,
     ):
+        if mode == "paged":
+            align = self._FLASH_ATTN_PAGE_ALIGNMENT
+            if page_size <= 0 or page_size % align != 0:
+                raise ValueError(
+                    f"--page-size must be a positive multiple of {align} "
+                    f"(flash-attn requirement for paged KV cache block size), "
+                    f"got {page_size}. Try 256, 512, or 1024."
+                )
+
         self.device = device
         self.dtype = dtype
         self.mode = mode
@@ -186,21 +200,38 @@ class Engine:
     def _compile_mlp_modules(self) -> None:
         """Wrap each transformer block's MLP with ``torch.compile``.
 
-        ``mode='default'`` with ``dynamic=True`` is chosen over
-        ``'reduce-overhead'`` so the compiled artifacts contain no inner
-        CUDA graphs of their own — that lets us stack cleanly with the
-        outer manual capture in ``CudaGraphRunner`` (CUDA does not allow
-        nested graph capture). The MLP is the most stable sub-region in
-        the decode path: shape ``(B, 1, hidden_size)`` and no Python
-        branching, so dynamo specializes once and Inductor fuses the
-        SwiGLU ``silu(gate(x)) * up(x) → down`` chain into one kernel.
+        Compile mode is chosen based on whether manual CUDA-graph capture
+        is also enabled:
+
+        * **Standalone** (``--torch-compile`` only): ``mode='reduce-overhead'``.
+          Inductor uses internal CUDA graphs to eliminate per-call Python /
+          dispatch overhead, which is what actually pays for compile at
+          decode batch sizes. Without this, the dynamo+inductor dispatch
+          path costs more than the SwiGLU fusion saves and the run regresses.
+
+        * **Stacked** (``--torch-compile --cuda-graph``): ``mode='default'``.
+          The outer manual graph in :class:`CudaGraphRunner` captures the
+          entire decode forward — we must NOT have inner CUDA graphs from
+          ``reduce-overhead`` inside it (CUDA does not allow nested capture).
+          ``mode='default'`` still gets Inductor's SwiGLU fusion; the outer
+          graph removes the per-op Python overhead.
+
+        The MLP is the most stable sub-region in the decode path: shape
+        ``(B, 1, hidden_size)`` and no Python branching, so dynamo
+        specializes cleanly. ``dynamic=True`` lets a single compilation
+        serve all batch sizes.
         """
+        if self.cuda_graph:
+            compile_mode = "default"
+        else:
+            compile_mode = "reduce-overhead"
         layers = self.model.model.layers
         for layer in layers:
-            layer.mlp = torch.compile(layer.mlp, mode="default", dynamic=True)
+            layer.mlp = torch.compile(layer.mlp, mode=compile_mode, dynamic=True)
         logger.info(
-            "torch.compile enabled on MLP of %d layers (mode=default, dynamic=True)",
+            "torch.compile enabled on MLP of %d layers (mode=%s, dynamic=True)",
             len(layers),
+            compile_mode,
         )
 
     def _build_pool(self, config: ModelConfig) -> KVMemoryPool:

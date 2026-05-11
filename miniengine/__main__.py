@@ -61,8 +61,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--page-size",
         type=int,
-        default=32,
-        help="Tokens per KV page. Only used when --mode paged.",
+        default=256,
+        help="Tokens per KV page. Only used when --mode paged. "
+        "Must be a positive multiple of 256 (flash-attn 2.8+ requirement).",
     )
     p.add_argument(
         "--torch-compile",

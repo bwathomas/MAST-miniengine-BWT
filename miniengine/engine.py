@@ -114,6 +114,12 @@ class Engine:
         self.model.eval()
         self.config = config
 
+        # Paged-mode list of ``(k_cache, v_cache)`` per layer. Stable for the
+        # engine's lifetime (the pool's per-layer tensors never change), so
+        # we build it exactly once instead of reconstructing 36 tuples on
+        # every step. ``_batched_prefill_paged`` and ``_batched_decode_paged``
+        # both reuse this.
+        self._paged_kv_caches: list[tuple[torch.Tensor, torch.Tensor]] | None = None
         if mode == "paged":
             _import_flash_attn()  # fail fast at startup if flash-attn is missing
             self.pool = self._build_pool(config)
@@ -125,6 +131,10 @@ class Engine:
                 self.pool.total_kv_tokens,
                 self._pool_bytes() / (1024**3),
             )
+            self._paged_kv_caches = [
+                (self.pool.k_cache(i), self.pool.v_cache(i))
+                for i in range(self.pool.num_layers)
+            ]
 
         if torch_compile:
             self._compile_layer_subregions()
@@ -368,14 +378,11 @@ class Engine:
             max_seqlen=max_seqlen,
             slot_mapping=slot_mapping,
         )
-        kv_caches = [
-            (self.pool.k_cache(i), self.pool.v_cache(i))
-            for i in range(self.pool.num_layers)
-        ]
+        assert self._paged_kv_caches is not None
         logits, _ = self.model(
             input_ids,
             position_ids,
-            kv_caches=kv_caches,
+            kv_caches=self._paged_kv_caches,
             paged_metadata=meta,
             last_token_indices=last_token_indices,
         )
@@ -556,27 +563,14 @@ class Engine:
 
         if use_graph:
             assert runner is not None
-            bucket = runner.bucket_for(batch_size)
-            scratch = runner.scratch_page
-            input_ids = torch.zeros((bucket, 1), dtype=torch.long, device=self.device)
-            position_ids = torch.zeros((bucket, 1), dtype=torch.long, device=self.device)
-            cache_seqlens = torch.ones((bucket,), dtype=torch.int32, device=self.device)
-            block_table = torch.full(
-                (bucket, runner.max_pages_per_seq),
-                scratch,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            for i, req in enumerate(requests):
-                input_ids[i, 0] = req.output_ids[-1]
-                position_ids[i, 0] = cache_lens[i]
-                cache_seqlens[i] = cache_lens[i]
-                pt = page_tables[i]
-                block_table[i, : len(pt)] = torch.as_tensor(
-                    pt, dtype=torch.int32, device=self.device
-                )
-            logits, _ = runner.replay(
-                input_ids, position_ids, block_table, cache_seqlens
+            # Hand raw Python lists to the runner. It stages them on its
+            # persistent pinned host scratch in one batched CPU pass, then
+            # issues four async H2D copies into the captured GPU buffers
+            # before replaying — instead of the previous per-element GPU
+            # writes that were silently re-serialising the critical path.
+            input_ids_list = [req.output_ids[-1] for req in requests]
+            logits, _ = runner.replay_paged_decode(
+                input_ids_list, cache_lens, page_tables
             )
         else:
             input_ids = torch.tensor(
@@ -600,14 +594,11 @@ class Engine:
                 block_table=block_table,
                 cache_seqlens=cache_seqlens,
             )
-            kv_caches = [
-                (self.pool.k_cache(i), self.pool.v_cache(i))
-                for i in range(self.pool.num_layers)
-            ]
+            assert self._paged_kv_caches is not None
             logits, _ = self.model(
                 input_ids,
                 position_ids,
-                kv_caches=kv_caches,
+                kv_caches=self._paged_kv_caches,
                 paged_metadata=meta,
             )
 

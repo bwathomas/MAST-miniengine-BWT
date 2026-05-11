@@ -57,6 +57,17 @@ class CudaGraphRunner:
         self._captured: bool = False
         self._graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self._inputs: dict[int, dict[str, torch.Tensor]] = {}
+        # Persistent pinned host scratch tensors per bucket. Replay stages
+        # per-step inputs here in bulk (no per-element GPU writes) and then
+        # async-copies the whole staging block into the captured GPU buffers.
+        # Pinning enables a true non-blocking H2D and avoids a pageable-memory
+        # fallback that would silently force a sync. See ``replay_paged_decode``.
+        self._host_inputs: dict[int, dict[str, torch.Tensor]] = {}
+        # Highest row index that was actually written into a bucket's host
+        # scratch on the previous replay. The next replay only needs to wipe
+        # rows ``[live_b : prev_live_b)`` back to safe init values; rows that
+        # have never been live since capture are still at their init state.
+        self._prev_live_b: dict[int, int] = {}
         self._meta: dict[int, PagedAttentionMetadata] = {}
         self._outputs: dict[int, torch.Tensor] = {}
         # Reserve a single pool page that all dummy rows (and the warmup /
@@ -205,40 +216,99 @@ class CudaGraphRunner:
             "block_table": block_table,
             "cache_seqlens": cache_seqlens,
         }
+        # Persistent pinned host scratch initialised to the same safe values
+        # used at capture time, so any row this bucket never touches (its
+        # "dummy" rows) implicitly carries valid inputs for the replay
+        # without per-step writes. ``replay_paged_decode`` only resets the
+        # rows that were *previously* live and are now dummy.
+        self._host_inputs[b] = {
+            "input_ids": torch.zeros((b, 1), dtype=torch.long, pin_memory=True),
+            "position_ids": torch.zeros((b, 1), dtype=torch.long, pin_memory=True),
+            "cache_seqlens": torch.ones((b,), dtype=torch.int32, pin_memory=True),
+            "block_table": torch.full(
+                (b, self.max_pages_per_seq),
+                self._scratch_page,
+                dtype=torch.int32,
+                pin_memory=True,
+            ),
+        }
         self._meta[b] = meta
         self._outputs[b] = logits
+        self._prev_live_b[b] = 0
 
     @torch.inference_mode()
-    def replay(
+    def replay_paged_decode(
         self,
-        input_ids: torch.Tensor,
-        position_ids: torch.Tensor,
-        block_table: torch.Tensor,
-        cache_seqlens: torch.Tensor,
+        input_ids_list: list[int],
+        cache_lens_list: list[int],
+        page_tables: list[list[int]],
     ) -> tuple[torch.Tensor, int]:
-        """Copy fresh inputs into the captured bucket's stable buffers and
-        replay. All input tensors must already be shaped for the bucket
-        (leading dim == ``self.bucket_for(live_B)``); dummy rows must carry
-        safe values (the engine fills them with cache_seqlens=1 + a valid
-        block_table[0] entry).
+        """Stage live-batch inputs into pinned host scratch in bulk, async
+        H2D into the captured bucket's stable buffers, replay.
 
-        Returns the (logits, bucket) from the graph's own output buffer —
-        this aliases graph-internal memory and is overwritten on the next
-        replay of the same bucket.
+        This is the single hot path for paged decode under cuda-graphs. The
+        critical-path constraint on smaller GPUs (e.g. L4) is that the
+        per-step input prep must not issue per-row H2D micro-syncs — that
+        completely defeats the captured graph. Here every per-step write
+        lands first on a pinned host tensor (CPU memcpy, no GPU sync), and
+        only four batched ``copy_(non_blocking=True)`` calls cross the PCIe
+        bus before ``graph.replay()``.
+
+        Dummy rows ``[live_b : bucket)`` already carry safe values from
+        capture (cache_seqlens=1, block_table=scratch_page, ids=0); rows
+        that were live on a *previous* replay but are dummy on this one are
+        wiped back to those values in ``[live_b : prev_live_b)`` only.
+
+        Returns ``(logits, bucket)``. ``logits`` aliases graph-internal
+        memory and is overwritten on the next replay of the same bucket;
+        callers that need it past the next replay must copy it.
         """
         if not self._captured:
-            raise RuntimeError("CudaGraphRunner.replay called before capture_all()")
-        b = input_ids.shape[0]
-        if b not in self._graphs:
-            raise ValueError(
-                f"no captured graph for bucket batch size {b}; "
-                f"captured buckets are {self.batch_sizes}"
+            raise RuntimeError(
+                "CudaGraphRunner.replay_paged_decode called before capture_all()"
             )
-        bufs = self._inputs[b]
-        bufs["input_ids"].copy_(input_ids)
-        bufs["position_ids"].copy_(position_ids)
-        bufs["block_table"].copy_(block_table)
-        bufs["cache_seqlens"].copy_(cache_seqlens)
+        live_b = len(input_ids_list)
+        if live_b == 0:
+            raise ValueError("replay_paged_decode requires at least one request")
+        b = self.bucket_for(live_b)
+        host = self._host_inputs[b]
+        dev = self._inputs[b]
+        max_pages = self.max_pages_per_seq
+
+        # ── Stage live rows on the pinned host scratch (CPU memcpys) ───
+        # Build small CPU tensors via ``torch.tensor(list)`` (C-fast) and
+        # slice-assign into the persistent pinned buffers in one shot per
+        # field. No per-element loops touching GPU memory.
+        ids_cpu = torch.tensor(input_ids_list, dtype=torch.long)
+        lens_long_cpu = torch.tensor(cache_lens_list, dtype=torch.long)
+        lens_int_cpu = lens_long_cpu.to(torch.int32)
+        host["input_ids"][:live_b, 0] = ids_cpu
+        host["position_ids"][:live_b, 0] = lens_long_cpu
+        host["cache_seqlens"][:live_b] = lens_int_cpu
+
+        # Block tables vary in length per request; pad to ``max_pages`` on
+        # CPU then bulk-assign. flash-attn only reads up to
+        # ``ceil(cache_seqlens[b]/page_size)`` entries per row, so padding
+        # with 0 is safe for live rows just like in the no-graph path.
+        padded = [pt + [0] * (max_pages - len(pt)) for pt in page_tables]
+        bt_cpu = torch.tensor(padded, dtype=torch.int32)
+        host["block_table"][:live_b] = bt_cpu
+
+        # ── Restore dummy values only for rows that were live last time
+        # but are dummy this time (incremental reset, not full sweep) ───
+        prev_live_b = self._prev_live_b.get(b, 0)
+        if live_b < prev_live_b:
+            host["input_ids"][live_b:prev_live_b].zero_()
+            host["position_ids"][live_b:prev_live_b].zero_()
+            host["cache_seqlens"][live_b:prev_live_b].fill_(1)
+            host["block_table"][live_b:prev_live_b].fill_(self._scratch_page)
+        self._prev_live_b[b] = live_b
+
+        # ── Four batched async H2D copies (pinned source ⇒ truly async) ─
+        dev["input_ids"].copy_(host["input_ids"], non_blocking=True)
+        dev["position_ids"].copy_(host["position_ids"], non_blocking=True)
+        dev["cache_seqlens"].copy_(host["cache_seqlens"], non_blocking=True)
+        dev["block_table"].copy_(host["block_table"], non_blocking=True)
 
         self._graphs[b].replay()
         return self._outputs[b], b

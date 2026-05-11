@@ -73,6 +73,9 @@ class PagedAttentionMetadata:
     block_table: torch.Tensor | None = None
     cache_seqlens: torch.Tensor | None = None
     num_splits: int = 0
+    # When set, the decode path skips ``flash_attn_with_kvcache`` and calls
+    # the supplied FlashInferDecoder. Always None on the prefill metadata.
+    flashinfer: object | None = None
 
 
 # ── Config ──────────────────────────────────────────────────────────────
@@ -429,11 +432,26 @@ class Attention(nn.Module):
             out = out_packed.view(1, seq_len, self.num_heads * head_dim)
             return out, None
 
-        _, flash_attn_with_kvcache = _import_flash_attn()
-
         q_dec = q.transpose(1, 2).contiguous()
         k_new = k.transpose(1, 2).contiguous()
         v_new = v.transpose(1, 2).contiguous()
+
+        if meta.flashinfer is not None:
+            # FlashInfer wants (B, H, D) — no seq dim — for decode-style
+            # single-token-per-row attention. Our q_dec is (B, 1, H, D)
+            # post-transpose, so squeeze the seq dim before/after the call.
+            assert seq_len == 1, "FlashInfer paged decode is 1-token-per-row"
+            out_flat = meta.flashinfer.attend_and_append(
+                q_dec.squeeze(1),
+                k_new.squeeze(1),
+                v_new.squeeze(1),
+                k_pool,
+                v_pool,
+            )
+            out = out_flat.view(bsz, 1, self.num_heads * head_dim)
+            return out, None
+
+        _, flash_attn_with_kvcache = _import_flash_attn()
 
         out = flash_attn_with_kvcache(
             q_dec,

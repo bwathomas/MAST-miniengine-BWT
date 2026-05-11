@@ -72,6 +72,8 @@ class Engine:
         rope_cache_cap: int = DEFAULT_ROPE_CACHE_CAP,
         prefill_token_budget: int = 0,
         recompute_recovery: bool = False,
+        cuda_graph_stats_interval: int = CudaGraphRunner.DEFAULT_STATS_INTERVAL,
+        use_flashinfer: bool = False,
     ):
         if mode == "paged":
             align = self._FLASH_ATTN_PAGE_ALIGNMENT
@@ -100,6 +102,15 @@ class Engine:
         self.rope_cache_cap: int = int(rope_cache_cap)
         self.prefill_token_budget: int = int(prefill_token_budget)
         self.recompute_recovery: bool = bool(recompute_recovery)
+        self.cuda_graph_stats_interval: int = int(cuda_graph_stats_interval)
+        self.use_flashinfer: bool = bool(use_flashinfer)
+        self.flashinfer_decoder: Any = None
+        if self.use_flashinfer and self.cuda_graph:
+            raise RuntimeError(
+                "--use-flashinfer is mutually exclusive with --cuda-graph for now: "
+                "the manual cudagraph capture path is hard-wired to flash-attn's "
+                "in-kernel KV writeback. Drop one of the two flags."
+            )
 
         # ── Tokenizer (still from HF — it's just a tokenizer) ──────────
         logger.info("Loading tokenizer from %s …", model_path)
@@ -181,8 +192,37 @@ class Engine:
             if mode != "paged":
                 raise RuntimeError("--cuda-graph requires --mode paged")
             sizes = cuda_graph_batch_sizes or [1, 2, 4, 8, 16, 32]
-            self.cuda_graph_runner = CudaGraphRunner(self, sizes)
+            self.cuda_graph_runner = CudaGraphRunner(
+                self,
+                sizes,
+                stats_interval=self.cuda_graph_stats_interval,
+            )
             self.cuda_graph_runner.capture_all()
+
+        if self.use_flashinfer:
+            if mode != "paged":
+                raise RuntimeError("--use-flashinfer requires --mode paged")
+            from miniengine.flashinfer_decoder import FlashInferDecoder
+
+            assert self.pool is not None
+            self.flashinfer_decoder = FlashInferDecoder(
+                pool=self.pool,
+                num_qo_heads=config.num_attention_heads,
+                num_kv_heads=config.num_key_value_heads,
+                head_dim=config.head_dim,
+                page_size=self.page_size,
+                dtype=dtype,
+                device=device,
+            )
+            logger.info(
+                "FlashInfer paged decoder ready  (num_qo_heads=%d, num_kv_heads=%d, "
+                "head_dim=%d, page_size=%d, workspace=%.1f MB)",
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                config.head_dim,
+                self.page_size,
+                self.flashinfer_decoder.workspace_bytes / (1024**2),
+            )
 
         # ── Stop tokens ─────────────────────────────────────────────────
         self.stop_token_ids: set[int] = set()
@@ -655,11 +695,16 @@ class Engine:
                 dtype=torch.int32,
                 device=self.device,
             )
+            # Hoist FlashInfer's per-batch plan out of the per-layer loop.
+            # Plan is CPU-side and would otherwise run 36× per step.
+            if self.flashinfer_decoder is not None:
+                self.flashinfer_decoder.plan(page_tables, cache_lens)
             meta = PagedAttentionMetadata(
                 is_prefill=False,
                 block_table=block_table,
                 cache_seqlens=cache_seqlens,
                 num_splits=self.flash_num_splits,
+                flashinfer=self.flashinfer_decoder,
             )
             assert self._paged_kv_caches is not None
             logits, _ = self.model(

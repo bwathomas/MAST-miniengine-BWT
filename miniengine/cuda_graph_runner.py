@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 class CudaGraphRunner:
     DEFAULT_MAX_PAGES_PER_SEQ = 128
     DEFAULT_ROPE_CAP = 8192
+    DEFAULT_STATS_INTERVAL = 1000
 
     def __init__(
         self,
@@ -44,6 +45,7 @@ class CudaGraphRunner:
         max_pages_per_seq: int = DEFAULT_MAX_PAGES_PER_SEQ,
         rope_cache_cap: int = DEFAULT_ROPE_CAP,
         warmup_iters: int = 3,
+        stats_interval: int = DEFAULT_STATS_INTERVAL,
     ) -> None:
         self.engine = engine
         sizes = sorted({int(b) for b in batch_sizes if int(b) > 0})
@@ -53,6 +55,20 @@ class CudaGraphRunner:
         self.max_pages_per_seq: int = int(max_pages_per_seq)
         self.rope_cache_cap: int = int(rope_cache_cap)
         self.warmup_iters: int = int(warmup_iters)
+
+        # Bucket-padding diagnostic counters. ``replay_paged_decode``
+        # increments ``_replay_count[b]`` on every replay of bucket ``b``
+        # and ``_replay_live_sum[b] += live_b`` for the live-row count.
+        # Mean live/bucket per row tells us how much GPU work the current
+        # ladder is wasting on dummy rows — the canonical B-02 diagnostic.
+        # On L4 the default ladder ``[1,2,4,8,16,32]`` jumps by 2× per step,
+        # so any uniform decode workload at conc=12 wastes ~25% of every
+        # forward. A denser ladder (e.g. ``1,2,4,8,12,16,20,24,28,32``)
+        # trades capture time for runtime efficiency.
+        self.stats_interval: int = int(stats_interval) if stats_interval >= 0 else 0
+        self._replay_count: dict[int, int] = {b: 0 for b in sizes}
+        self._replay_live_sum: dict[int, int] = {b: 0 for b in sizes}
+        self._total_replays: int = 0
 
         self._captured: bool = False
         self._graphs: dict[int, torch.cuda.CUDAGraph] = {}
@@ -312,4 +328,66 @@ class CudaGraphRunner:
         dev["block_table"].copy_(host["block_table"], non_blocking=True)
 
         self._graphs[b].replay()
+
+        # ── Bucket-padding diagnostic (item 10 / B-02 visibility) ──────
+        # Periodic summary: per-bucket mean(live/bucket). Mean=1.0 means
+        # the bucket was always exactly filled; lower means the ladder
+        # is too coarse for the workload's batch distribution.
+        self._replay_count[b] += 1
+        self._replay_live_sum[b] += live_b
+        self._total_replays += 1
+        if (
+            self.stats_interval > 0
+            and self._total_replays % self.stats_interval == 0
+        ):
+            self._log_padding_stats()
+
         return self._outputs[b], b
+
+    def _log_padding_stats(self) -> None:
+        parts: list[str] = []
+        weighted_eff = 0.0
+        total = 0
+        for b in self.batch_sizes:
+            n = self._replay_count[b]
+            if n == 0:
+                continue
+            mean_live = self._replay_live_sum[b] / n
+            eff = mean_live / float(b)
+            parts.append(f"b={b}:n={n} live={mean_live:.1f} ({100 * eff:.0f}%)")
+            weighted_eff += eff * n
+            total += n
+        if total == 0:
+            return
+        avg = weighted_eff / total
+        logger.info(
+            "CUDA-graph bucket usage  [%d replays, mean fill=%.0f%%]  %s",
+            total,
+            100 * avg,
+            "  ".join(parts),
+        )
+
+    def padding_stats(self) -> dict[str, float | dict[int, dict[str, float]]]:
+        """Snapshot of the per-bucket fill stats since startup."""
+        per_bucket: dict[int, dict[str, float]] = {}
+        weighted = 0.0
+        total = 0
+        for b in self.batch_sizes:
+            n = self._replay_count[b]
+            if n == 0:
+                per_bucket[b] = {"replays": 0, "mean_live": 0.0, "fill": 0.0}
+                continue
+            mean_live = self._replay_live_sum[b] / n
+            eff = mean_live / float(b)
+            per_bucket[b] = {
+                "replays": float(n),
+                "mean_live": mean_live,
+                "fill": eff,
+            }
+            weighted += eff * n
+            total += n
+        return {
+            "total_replays": float(total),
+            "mean_fill": weighted / total if total else 0.0,
+            "per_bucket": per_bucket,
+        }

@@ -125,6 +125,22 @@ def parse_args() -> argparse.Namespace:
         "prefill, and re-admit (PagedAttention §4.5). Default off keeps "
         "the FCFS-wait behaviour.",
     )
+    p.add_argument(
+        "--cuda-graph-stats-interval",
+        type=int,
+        default=1000,
+        help="Every N replays, log per-bucket fill % so we can see how "
+        "much GPU work the current cudagraph ladder wastes on dummy "
+        "rows (B-02 visibility). 0 = silent.",
+    )
+    p.add_argument(
+        "--use-flashinfer",
+        action="store_true",
+        help="Replace flash_attn_with_kvcache with FlashInfer's "
+        "BatchDecodeWithPagedKVCacheWrapper for paged decode "
+        "(FlashInfer §3.2.2). Requires pip install flashinfer-python. "
+        "Mutually exclusive with --cuda-graph.",
+    )
     return p.parse_args()
 
 
@@ -164,6 +180,8 @@ def main() -> None:
         rope_cache_cap=args.rope_cache_cap,
         prefill_token_budget=args.prefill_token_budget,
         recompute_recovery=args.recompute_recovery,
+        cuda_graph_stats_interval=args.cuda_graph_stats_interval,
+        use_flashinfer=args.use_flashinfer,
     )
     sched = Scheduler(engine=engine, max_running=args.max_running, mode=args.mode)
 
